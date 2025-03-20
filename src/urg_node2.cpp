@@ -53,6 +53,7 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   angle_max_ = declare_parameter<double>("angle_max", M_PI);
   skip_ = declare_parameter<int>("skip", 0);
   cluster_ = declare_parameter<int>("cluster", 1);
+  is_uct_x001_ = declare_parameter<bool>("is_uct_x001", false);
 }
 
 // デストラクタ
@@ -76,6 +77,10 @@ UrgNode2::CallbackReturn UrgNode2::on_configure(const rclcpp_lifecycle::State & 
   // Publisher設定
   if (use_multiecho_) {
     echo_pub_ = std::make_unique<laser_proc::LaserPublisher>(get_node_topics_interface(), 20);
+  } else if (is_uct_x001_) {
+    scan_pub_3layer_[0] = create_publisher<sensor_msgs::msg::LaserScan>("scan_0", rclcpp::QoS(20));
+    scan_pub_3layer_[1] = create_publisher<sensor_msgs::msg::LaserScan>("scan_1", rclcpp::QoS(20));
+    scan_pub_3layer_[2] = create_publisher<sensor_msgs::msg::LaserScan>("scan_2", rclcpp::QoS(20));
   } else {
     scan_pub_ = create_publisher<sensor_msgs::msg::LaserScan>("scan", rclcpp::QoS(20));
   }
@@ -97,6 +102,11 @@ UrgNode2::CallbackReturn UrgNode2::on_activate(const rclcpp_lifecycle::State & s
     // publisherの有効化
     if (scan_pub_) {
       scan_pub_->on_activate();
+    }
+    for(auto& pub : scan_pub_3layer_) {
+      if (pub) {
+        pub->on_activate();
+      }
     }
 
     // Diagnostics開始
@@ -133,7 +143,11 @@ UrgNode2::CallbackReturn UrgNode2::on_cleanup(const rclcpp_lifecycle::State & st
   stop_thread();
 
   // publisherの解放
-  if (use_multiecho_) {
+  if(is_uct_x001_) {
+    scan_pub_3layer_[0].reset();
+    scan_pub_3layer_[1].reset();
+    scan_pub_3layer_[2].reset();
+  } else if (use_multiecho_) {
     echo_pub_.reset();
   } else {
     scan_pub_.reset();
@@ -157,7 +171,11 @@ UrgNode2::CallbackReturn UrgNode2::on_shutdown(const rclcpp_lifecycle::State & s
   stop_diagnostics();
 
   // publisherの解放
-  if (use_multiecho_) {
+  if(is_uct_x001_) {
+    scan_pub_3layer_[0].reset();
+    scan_pub_3layer_[1].reset();
+    scan_pub_3layer_[2].reset();
+  } else if (use_multiecho_) {
     echo_pub_.reset();
   } else {
     scan_pub_.reset();
@@ -181,7 +199,11 @@ UrgNode2::CallbackReturn UrgNode2::on_error(const rclcpp_lifecycle::State & stat
   stop_diagnostics();
 
   // publisherの解放
-  if (use_multiecho_) {
+  if(is_uct_x001_) {
+    scan_pub_3layer_[0].reset();
+    scan_pub_3layer_[1].reset();
+    scan_pub_3layer_[2].reset();
+  } else if (use_multiecho_) {
     echo_pub_.reset();
   } else {
     scan_pub_.reset();
@@ -215,6 +237,7 @@ void UrgNode2::initialize()
   angle_max_ = get_parameter("angle_max").as_double();
   skip_ = get_parameter("skip").as_int();
   cluster_ = get_parameter("cluster").as_int();
+  is_uct_x001_ = get_parameter("is_uct_x001").as_bool();
 
   // 範囲チェック
   angle_min_ = (angle_min_ < -M_PI) ? -M_PI : ((angle_min_ > M_PI) ? M_PI : angle_min_);
@@ -273,7 +296,9 @@ bool UrgNode2::connect()
     ss << "serial ";
   }
   ss << "device with ";
-  if (publish_multiecho_) {
+  if(is_uct_x001_) {
+    ss << "3 layer (UCT-X001) ";
+  } else if (publish_multiecho_) {
     ss << "multiecho ";
   } else {
     ss << "single ";
@@ -308,6 +333,23 @@ bool UrgNode2::connect()
       RCLCPP_WARN(
         get_logger(),
         "parameter 'publish_multiecho' is true, but this device does not support multiecho scan mode. switch single scan mode.");
+    }
+  }
+  // connected Lidar is UCT-X001
+  if (is_uct_x001_) {
+    if(product_name_ != "UCT-X001") {
+      RCLCPP_WARN(
+        get_logger(),
+        "parameter 'is_uct_x001' is true, but this device is %s. switch to normal mode.", product_name_.c_str());
+      is_uct_x001_ = false;
+    }else{
+      if(!publish_intensity_){
+        RCLCPP_WARN(
+          get_logger(),
+          "parameter 'is_uct_x001' is true, but 'publish_intensity' is false. layer data of UCT-X001 is included intensity data. switch intensity active.");
+        publish_intensity_ = true;
+      }
+      use_intensity_ = true;
     }
   }
 
@@ -488,6 +530,24 @@ void UrgNode2::scan_thread()
           sensor_status_ = urg_sensor_state(&urg_);
           is_stable_ = urg_is_stable(&urg_);
         }
+      } else if (is_uct_x001_) {
+        sensor_msgs::msg::LaserScan msg;
+        size_t layer = 0;
+        if (create_scan_message(msg, &layer)) {
+          if(layer < 3){
+            scan_pub_3layer_[layer]->publish(msg);
+          }
+          if (scan_freq_) {
+            scan_freq_->tick();
+          }
+        } else {
+          RCLCPP_WARN(get_logger(), "Could not get 3 layer scan.");
+          error_count_++;
+          total_error_count_++;
+          device_status_ = urg_sensor_status(&urg_);
+          sensor_status_ = urg_sensor_state(&urg_);
+          is_stable_ = urg_is_stable(&urg_);
+        }
       } else {
         sensor_msgs::msg::LaserScan msg;
         if (create_scan_message(msg)) {
@@ -530,7 +590,7 @@ void UrgNode2::scan_thread()
 }
 
 // スキャンデータ取得
-bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
+bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg, size_t * layer)
 {
   msg.header.frame_id = header_frame_id_;
   msg.angle_min = topic_angle_min_;
@@ -546,7 +606,10 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
   rclcpp::Clock system_clock(RCL_SYSTEM_TIME);
   rclcpp::Time system_time_stamp = system_clock.now();
 
-  if (use_intensity_) {
+  if (is_uct_x001_) {
+    num_beams = urg_get_distance_intensity(&urg_, &distance_[0], &intensity_[0], &time_stamp);
+    if(layer != nullptr) *layer = intensity_[0] & 0x03;
+  } else if (use_intensity_) {
     num_beams = urg_get_distance_intensity(&urg_, &distance_[0], &intensity_[0], &time_stamp);
   } else {
     num_beams = urg_get_distance(&urg_, &distance_[0], &time_stamp);
@@ -723,7 +786,12 @@ void UrgNode2::start_diagnostics(void)
   diagnostic_updater_->add("Hardware Status", this, &UrgNode2::populate_diagnostics_status);
 
   // Diagnosticsトピック設定
-  diagnostics_freq_ = 1.0 / (scan_period_ * (skip_ + 1));
+  if(is_uct_x001_) {
+    // UCT-X001 has 3 layers. So, the frequency is 3 times.
+    diagnostics_freq_ = 3.0 / (scan_period_ * (skip_ + 1));
+  } else {
+    diagnostics_freq_ = 1.0 / (scan_period_ * (skip_ + 1));
+  }
   if (use_multiecho_) {
     echo_freq_.reset(
       new diagnostic_updater::HeaderlessTopicDiagnostic(

@@ -170,10 +170,11 @@ private:
    * @brief スキャントピック作成
    * @details LiDARから取得したスキャン情報のトピックへの変換を行う
    * @param[out] msg スキャンデータメッセージ
+   * @param[out] layer レイヤー情報
    * @retval true 正常終了
    * @retval false 取得失敗
    */
-  bool create_scan_message(sensor_msgs::msg::LaserScan & msg);
+  bool create_scan_message(sensor_msgs::msg::LaserScan & msg, size_t * layer = nullptr);
 
   /**
    * @brief スキャントピック作成（マルチエコー）
@@ -273,6 +274,8 @@ private:
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::LaserScan>> scan_pub_;
   /** マルチエコースキャンデータのpublisher */
   std::unique_ptr<laser_proc::LaserPublisher> echo_pub_;
+  /** 3layer scan publisher for UCT-X001 */
+  std::array<std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::LaserScan>>, 3> scan_pub_3layer_;
 
   /** Diagnositcs Updater */
   std::unique_ptr<diagnostic_updater::Updater> diagnostic_updater_;
@@ -325,6 +328,8 @@ private:
   int skip_;
   /** パラメータ"cluster" : グルーピング設定 */
   int cluster_;
+  /** parameter "is_uct-x001" : connected Lidar is UCT-X001 */
+  bool is_uct_x001_;
 
   /** デバイス状態 : urg_sensor_status()の値を格納 */
   std::string device_status_;
